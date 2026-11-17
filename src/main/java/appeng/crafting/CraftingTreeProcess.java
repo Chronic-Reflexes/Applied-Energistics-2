@@ -49,7 +49,7 @@ public class CraftingTreeProcess {
 
     public CraftingTreeProcess(ICraftingService cc, CraftingCalculation job,
             IPatternDetails details,
-            CraftingTreeNode craftingTreeNode) {
+            CraftingTreeNode craftingTreeNode) throws InterruptedException {
         this.parent = craftingTreeNode;
         this.details = details;
         this.job = job;

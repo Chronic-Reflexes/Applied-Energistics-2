@@ -19,7 +19,10 @@
 package appeng.crafting;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.base.Stopwatch;
@@ -29,13 +32,16 @@ import org.jetbrains.annotations.Nullable;
 
 import net.minecraft.world.level.Level;
 
+import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.IGrid;
 import appeng.api.networking.crafting.CalculationStrategy;
 import appeng.api.networking.crafting.ICraftingPlan;
+import appeng.api.networking.crafting.ICraftingService;
 import appeng.api.networking.crafting.ICraftingSimulationRequester;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
+import appeng.crafting.execution.InputTemplate;
 import appeng.core.AELog;
 import appeng.crafting.inv.ChildCraftingSimulationState;
 import appeng.crafting.inv.CraftingSimulationState;
@@ -66,6 +72,21 @@ public class CraftingCalculation {
      * {@link #monitor}.
      */
     private boolean sliceOpen = false;
+    /**
+     * Set on the calculator thread before a background plan walks the tree. The root node is built earlier, on the
+     * server thread, and keeps using the live crafting service.
+     */
+    private volatile boolean resolvesOffThread = false;
+    private SnapshotQuery snapshotQuery = SnapshotQuery.NONE;
+    private AEKey queryKey;
+    private IPatternDetails.IInput queryInput;
+    private List<InputTemplate> queryTemplates;
+    private boolean queryReady = true;
+    private Object queryResult;
+    private Throwable queryError;
+    private final Map<AEKey, Boolean> emitAnswers = new HashMap<>();
+    private final Map<AEKey, List<IPatternDetails>> patternAnswers = new HashMap<>();
+    private final Map<IPatternDetails.IInput, Map<AEKey, Boolean>> validityAnswers = new IdentityHashMap<>();
     private int time = 5;
     private int incTime = Integer.MAX_VALUE;
     private final List<CraftAttempt> attempts = AELog.isCraftingLogEnabled() ? new ArrayList<>() : null;
@@ -84,7 +105,12 @@ public class CraftingCalculation {
         var craftingService = grid.getCraftingService();
         this.networkInv = new NetworkCraftingSimulationState(storage, simRequester.getActionSource());
 
-        this.tree = new CraftingTreeNode(craftingService, this, this.output, 1, null, -1);
+        try {
+            this.tree = new CraftingTreeNode(craftingService, this, this.output, 1, null, -1);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
     }
 
     void addMissing(AEKey what, long amount) {
@@ -94,6 +120,7 @@ public class CraftingCalculation {
     public ICraftingPlan run() {
         try {
             TickHandler.instance().registerCraftingSimulation(this.level, this);
+            this.resolvesOffThread = !this.blockServerTick;
             this.handlePausing();
 
             var plan = computePlan();
@@ -278,6 +305,20 @@ public class CraftingCalculation {
      * @return true if this needs more simulation
      */
     public boolean grantSimulationTime(int micros) {
+        // Answer while the calculator is paused, then publish the result. Flushing first lets that answer see pattern
+        // updates that were queued during the previous slice.
+        this.serviceSnapshotQuery();
+
+        synchronized (this.monitor) {
+            if (this.done) {
+                return false;
+            }
+
+            if (this.running) {
+                return true;
+            }
+        }
+
         if (this.craftingService != null) {
             this.craftingService.flushDeferredCraftingProviderUpdates();
         }
@@ -355,6 +396,212 @@ public class CraftingCalculation {
 
     public boolean hasMultiplePaths() {
         return this.tree.hasMultiplePaths();
+    }
+
+    boolean resolvesOffThread() {
+        return this.resolvesOffThread;
+    }
+
+    @Nullable
+    ICraftingService liveCraftingService() {
+        return this.craftingService;
+    }
+
+    boolean canEmit(AEKey key) throws InterruptedException {
+        var cached = this.emitAnswers.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        var answer = (PatternLookup) this.awaitQuery(SnapshotQuery.PATTERNS, key, null, null);
+        this.storeLookup(answer);
+        return Boolean.TRUE.equals(this.emitAnswers.get(key));
+    }
+
+    List<IPatternDetails> patternsFor(AEKey key) throws InterruptedException {
+        var cached = this.patternAnswers.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        var answer = (PatternLookup) this.awaitQuery(SnapshotQuery.PATTERNS, key, null, null);
+        this.storeLookup(answer);
+        cached = this.patternAnswers.get(key);
+        return cached != null ? cached : List.of();
+    }
+
+    @Nullable
+    AEKey fuzzyCraftable(AEKey key, IPatternDetails.IInput input) throws InterruptedException {
+        return (AEKey) this.awaitQuery(SnapshotQuery.FUZZY, key, input, null);
+    }
+
+    List<InputTemplate> validTemplates(IPatternDetails.IInput input, List<InputTemplate> templates)
+            throws InterruptedException {
+        var known = this.validityAnswers.computeIfAbsent(input, ignored -> new HashMap<>());
+        var unknown = new ArrayList<InputTemplate>();
+        for (var template : templates) {
+            if (!known.containsKey(template.key())) {
+                unknown.add(template);
+            }
+        }
+
+        if (!unknown.isEmpty()) {
+            var accepted = (List<?>) this.awaitQuery(SnapshotQuery.TEMPLATES, null, input, unknown);
+            var acceptedKeys = new java.util.HashSet<AEKey>();
+            for (var entry : accepted) {
+                acceptedKeys.add(((InputTemplate) entry).key());
+            }
+            for (var template : unknown) {
+                known.put(template.key(), acceptedKeys.contains(template.key()));
+            }
+        }
+
+        var valid = new ArrayList<InputTemplate>();
+        for (var template : templates) {
+            if (Boolean.TRUE.equals(known.get(template.key()))) {
+                valid.add(template);
+            }
+        }
+        return valid;
+    }
+
+    private void storeLookup(PatternLookup answer) {
+        this.emitAnswers.putAll(answer.emit);
+        this.patternAnswers.putAll(answer.patternsByKey);
+    }
+
+    private Object awaitQuery(SnapshotQuery kind, @Nullable AEKey key, @Nullable IPatternDetails.IInput input,
+            @Nullable List<InputTemplate> templates) throws InterruptedException {
+        synchronized (this.monitor) {
+            this.snapshotQuery = kind;
+            this.queryKey = key;
+            this.queryInput = input;
+            this.queryTemplates = templates;
+            this.queryResult = null;
+            this.queryError = null;
+            this.queryReady = false;
+
+            while (!this.queryReady) {
+                this.monitor.wait();
+            }
+
+            if (this.queryError != null) {
+                throw new RuntimeException(this.queryError);
+            }
+            return this.queryResult;
+        }
+    }
+
+    /**
+     * Fills one pending snapshot query. Called on the server thread. The calculator thread is waiting, so this is the
+     * only side that touches the live crafting service or pattern validity for a background plan.
+     */
+    private void serviceSnapshotQuery() {
+        SnapshotQuery kind;
+        AEKey key;
+        IPatternDetails.IInput input;
+        List<InputTemplate> templates;
+        synchronized (this.monitor) {
+            if (this.queryReady || this.snapshotQuery == SnapshotQuery.NONE) {
+                return;
+            }
+            kind = this.snapshotQuery;
+            key = this.queryKey;
+            input = this.queryInput;
+            templates = this.queryTemplates;
+        }
+
+        if (this.craftingService != null) {
+            this.craftingService.flushDeferredCraftingProviderUpdates();
+        }
+
+        Object result = null;
+        Throwable error = null;
+        try {
+            result = switch (kind) {
+                case PATTERNS -> this.lookupPatterns(key);
+                case FUZZY -> this.craftingService == null ? null
+                        : this.craftingService.getFuzzyCraftable(key, candidate -> input.isValid(candidate, this.level));
+                case TEMPLATES -> this.filterTemplates(input, templates);
+                case NONE -> null;
+            };
+        } catch (Throwable t) {
+            error = t;
+        }
+
+        synchronized (this.monitor) {
+            if (this.snapshotQuery != kind || this.queryReady) {
+                return;
+            }
+            this.queryResult = result;
+            this.queryError = error;
+            this.queryReady = true;
+            this.snapshotQuery = SnapshotQuery.NONE;
+            this.monitor.notifyAll();
+        }
+    }
+
+    private PatternLookup lookupPatterns(AEKey key) {
+        var emit = new HashMap<AEKey, Boolean>();
+        var patternsByKey = new HashMap<AEKey, List<IPatternDetails>>();
+        this.readPatternKey(key, emit, patternsByKey);
+
+        var patterns = patternsByKey.getOrDefault(key, List.of());
+        for (var details : patterns) {
+            for (var patternInput : details.getInputs()) {
+                var possible = patternInput.getPossibleInputs();
+                if (possible.length == 0 || possible[0] == null) {
+                    continue;
+                }
+                this.readPatternKey(possible[0].what(), emit, patternsByKey);
+            }
+        }
+        return new PatternLookup(emit, patternsByKey);
+    }
+
+    private void readPatternKey(AEKey key, Map<AEKey, Boolean> emit, Map<AEKey, List<IPatternDetails>> patternsByKey) {
+        if (patternsByKey.containsKey(key) || this.craftingService == null) {
+            emit.putIfAbsent(key, false);
+            patternsByKey.putIfAbsent(key, List.of());
+            return;
+        }
+
+        emit.put(key, this.craftingService.canEmitFor(key));
+        var patterns = List.copyOf(this.craftingService.getCraftingFor(key));
+        for (var details : patterns) {
+            for (var patternInput : details.getInputs()) {
+                var possible = patternInput.getPossibleInputs();
+                if (possible.length > 0 && possible[0] != null) {
+                    patternInput.getRemainingKey(possible[0].what());
+                }
+            }
+            details.getOutputs();
+        }
+        patternsByKey.put(key, patterns);
+    }
+
+    private List<InputTemplate> filterTemplates(@Nullable IPatternDetails.IInput input, List<InputTemplate> templates) {
+        if (input == null || templates == null) {
+            return List.of();
+        }
+
+        var accepted = new ArrayList<InputTemplate>();
+        for (var template : templates) {
+            if (input.isValid(template.key(), this.level)) {
+                accepted.add(template);
+            }
+        }
+        return List.copyOf(accepted);
+    }
+
+    private enum SnapshotQuery {
+        NONE,
+        PATTERNS,
+        FUZZY,
+        TEMPLATES
+    }
+
+    private record PatternLookup(Map<AEKey, Boolean> emit, Map<AEKey, List<IPatternDetails>> patternsByKey) {
     }
 
     private record CraftAttempt(String description, Stopwatch stopwatch) {

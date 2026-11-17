@@ -67,7 +67,7 @@ public class CraftingTreeNode {
     private final boolean canEmit;
 
     public CraftingTreeNode(ICraftingService cc, CraftingCalculation job, AEKey what, long amount,
-            CraftingTreeProcess par, int slot) {
+            CraftingTreeProcess par, int slot) throws InterruptedException {
         this.parent = par;
         this.parentInput = slot == -1 ? null : par.details.getInputs()[slot];
         this.level = job.getLevel();
@@ -75,10 +75,14 @@ public class CraftingTreeNode {
         this.what = findCraftedStack(cc, what);
         this.amount = amount;
 
-        this.canEmit = cc.canEmitFor(what);
+        this.canEmit = job.resolvesOffThread() ? job.canEmit(what) : cc.canEmitFor(what);
     }
 
-    private AEKey findCraftedStack(ICraftingService cc, AEKey wat) {
+    private AEKey findCraftedStack(ICraftingService cc, AEKey wat) throws InterruptedException {
+        if (this.job.resolvesOffThread()) {
+            return findCraftedStackOffThread(wat);
+        }
+
         if (cc.canEmitFor(wat)) {
             return wat; // if we can emit for something, use that.
         }
@@ -108,7 +112,35 @@ public class CraftingTreeNode {
         return wat;
     }
 
-    private void buildChildPatterns() {
+    /**
+     * Same resolution as {@link #findCraftedStack}, but pattern and recipe checks are filled in on the server thread.
+     */
+    private AEKey findCraftedStackOffThread(AEKey wat) throws InterruptedException {
+        if (this.job.canEmit(wat)) {
+            return wat;
+        }
+
+        var patterns = this.job.patternsFor(wat);
+
+        if (patterns.isEmpty() && parentInput != null) {
+            long acceptableAmount = parentInput.getPossibleInputs()[0].amount();
+
+            for (var possibleInput : parentInput.getPossibleInputs()) {
+                if (possibleInput.amount() != acceptableAmount) {
+                    continue;
+                }
+
+                var fuzzy = this.job.fuzzyCraftable(possibleInput.what(), this.parentInput);
+                if (fuzzy != null) {
+                    return fuzzy;
+                }
+            }
+        }
+
+        return wat;
+    }
+
+    private void buildChildPatterns() throws InterruptedException {
         // Sanity check: this should never be called if this is emitable
         if (this.canEmit) {
             throw new IllegalStateException("Internal AE2 error: this node is emitable, it shouldn't use patterns!");
@@ -117,15 +149,26 @@ public class CraftingTreeNode {
         if (this.nodes == null) {
             this.nodes = new ArrayList<>();
 
-            var gridNode = this.job.simRequester.getGridNode();
+            if (this.job.resolvesOffThread()) {
+                var craftingService = this.job.liveCraftingService();
+                if (craftingService != null) {
+                    for (var details : this.job.patternsFor(this.what)) {
+                        if (this.parent == null || this.parent.notRecursive(details)) {
+                            this.nodes.add(new CraftingTreeProcess(craftingService, job, details, this));
+                        }
+                    }
+                }
+            } else {
+                var gridNode = this.job.simRequester.getGridNode();
 
-            // If the node is null, we just skip patterns and let the request (likely) fail.
-            if (gridNode != null) {
-                var craftingService = gridNode.getGrid().getCraftingService();
+                // If the node is null, we just skip patterns and let the request (likely) fail.
+                if (gridNode != null) {
+                    var craftingService = gridNode.getGrid().getCraftingService();
 
-                for (var details : craftingService.getCraftingFor(this.what)) {
-                    if (this.parent == null || this.parent.notRecursive(details)) {
-                        this.nodes.add(new CraftingTreeProcess(craftingService, job, details, this));
+                    for (var details : craftingService.getCraftingFor(this.what)) {
+                        if (this.parent == null || this.parent.notRecursive(details)) {
+                            this.nodes.add(new CraftingTreeProcess(craftingService, job, details, this));
+                        }
                     }
                 }
             }
@@ -301,9 +344,18 @@ public class CraftingTreeNode {
      * 
      * @param inv Crafting inventory, used for fuzzy matching.
      */
-    private Iterable<InputTemplate> getValidItemTemplates(ICraftingInventory inv) {
+    private Iterable<InputTemplate> getValidItemTemplates(ICraftingInventory inv) throws InterruptedException {
         if (this.parentInput == null)
             return List.of(new InputTemplate(what, 1));
+        if (this.job.resolvesOffThread()) {
+            var templates = new ArrayList<InputTemplate>();
+            for (var stack : this.parentInput.getPossibleInputs()) {
+                for (var fuzz : inv.findFuzzyTemplates(stack.what())) {
+                    templates.add(new InputTemplate(fuzz, stack.amount()));
+                }
+            }
+            return this.job.validTemplates(this.parentInput, templates);
+        }
         return CraftingCpuHelper.getValidItemTemplates(inv, this.parentInput, level);
     }
 
